@@ -17,7 +17,11 @@ impl QNetwork {
         let seq = nn::seq()
             .add(nn::linear(vs / "layer1", 4, 64, Default::default()))
             .add_fn(|xs| xs.relu())
-            .add(nn::linear(vs / "layer2", 64, 2, Default::default()));
+            .add(nn::linear(vs / "layer2", 64, 64, Default::default()))
+            .add_fn(|xs| xs.relu())
+            .add(nn::linear(vs / "layer3", 64, 64, Default::default()))
+            .add_fn(|xs| xs.relu())
+            .add(nn::linear(vs / "layer4", 64, 2, Default::default()));
         Self { seq }
     }
 }
@@ -29,12 +33,13 @@ impl nn::Module for QNetwork {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Transition {
-    state: State,
-    action: Action,
-    reward: f32,
-    next_state: State,
-    done: bool,
+    pub state: State,
+    pub action: Action,
+    pub reward: f32,
+    pub next_state: State,
+    pub done: bool,
 }
 
 pub struct ReplayBuffer {
@@ -52,7 +57,7 @@ impl ReplayBuffer {
 
     pub fn push(&mut self, transition: Transition) {
         self.transitions.push_back(transition);
-        if self.capacity > self.transitions.len() {
+        if self.transitions.len() > self.capacity {
             self.transitions.pop_front();
         }
     }
@@ -77,13 +82,15 @@ impl ReplayBuffer {
 pub struct DQNAgent {
     q_network: QNetwork,
     target_network: QNetwork,
-    replay_buffer: ReplayBuffer,
+    pub replay_buffer: ReplayBuffer,
     optimizer: tch::nn::Optimizer,
     step_counter: u64,
-    epsilon: f32,
+    pub epsilon: f32,
     gamma: f32,
     vs_main: VarStore,
     vs_target: VarStore,
+    pub epsilon_decay: f32,
+    epsilon_min: f32,
 }
 
 impl DQNAgent {
@@ -96,12 +103,15 @@ impl DQNAgent {
         let target_network = QNetwork::new(&vs_target.root());
 
         vs_target.copy(&vs_main).unwrap();
-        let optimizer = tch::nn::Adam::default().build(&vs_main, 1e-3).unwrap();
 
-        let replay_buffer = ReplayBuffer::new(10000);
+        let optimizer = tch::nn::Adam::default().build(&vs_main, 1e-4).unwrap();
+
+        let replay_buffer = ReplayBuffer::new(50000);
         let step_counter = 0;
         let epsilon = 1.0;
         let gamma = 0.99;
+        let epsilon_decay = 0.995;
+        let epsilon_min = 0.01;
 
         Self {
             q_network,
@@ -113,13 +123,15 @@ impl DQNAgent {
             gamma,
             vs_main,
             vs_target,
+            epsilon_decay,
+            epsilon_min,
         }
     }
 
     pub fn action(&self, state: &State) -> Action {
         let rand: f32 = random_range(0.0..1.0);
 
-        if self.epsilon < rand {
+        if self.epsilon > rand {
             let random_decision = random_range(0..1);
             match random_decision {
                 0 => {
@@ -159,6 +171,10 @@ impl DQNAgent {
     }
 
     pub fn train(&mut self, batch_size: usize) {
+        if self.replay_buffer.transitions.len() < batch_size {
+            return;
+        }
+
         /*
         Preparation
          */
@@ -248,13 +264,53 @@ impl DQNAgent {
          */
 
         /*
-        The Formula
+        The Formula Double DQN
          */
 
-        let next_q_values = self.target_network.forward(&tensor_next_states);
-        let max_next_q_values = next_q_values.max_dim(1, false).0;
+        let next_actions = self.q_network.forward(&tensor_next_states).argmax(1, true);
+
+        //let next_q_values = self.target_network.forward(&tensor_next_states);
+        //let max_next_q_values = next_q_values.max_dim(1, false).0;
+        let max_next_q_values = self
+            .target_network
+            .forward(&tensor_next_states)
+            .gather(1, &next_actions, false)
+            .squeeze_dim(1);
 
         let target_q_values =
             &tensor_rewards + (self.gamma * max_next_q_values.view([-1, 1]) * &tensor_dones);
+
+        let predicted_q_values =
+            self.q_network
+                .forward(&tensor_states)
+                .gather(1, &tensor_actions, false);
+
+        let loss = predicted_q_values.mse_loss(&target_q_values, tch::Reduction::Mean);
+
+        /*
+        Training
+         */
+
+        self.optimizer.zero_grad();
+        loss.backward();
+        self.optimizer.step();
+
+        if self.epsilon > self.epsilon_min {
+            self.epsilon *= self.epsilon_decay;
+        }
+    }
+
+    pub fn update_target_network(&mut self) {
+        self.vs_target.copy(&self.vs_main).unwrap();
+    }
+
+    pub fn save(&self, path: &str) -> Result<(), tch::TchError> {
+        self.vs_main.save(path)
+    }
+
+    pub fn load(&mut self, path: &str) -> Result<(), tch::TchError> {
+        self.vs_main.load(path)?;
+        self.vs_target.copy(&self.vs_main)?;
+        Ok(())
     }
 }

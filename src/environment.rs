@@ -12,7 +12,7 @@ pub struct CartPole {
     position_limit: f32,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct State {
     pub cart_position: f32,
     pub cart_velocity: f32,
@@ -20,7 +20,7 @@ pub struct State {
     pub pole_velocity: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Action {
     Left,
     Right,
@@ -90,5 +90,10 @@ impl CartPole {
         let reward = if done { 0.0 } else { 1.0 };
 
         (self.current_state.clone(), reward, done)
+    }
+
+    pub fn reset(&mut self) -> State {
+        self.current_state = State::default();
+        self.current_state.clone()
     }
 }
