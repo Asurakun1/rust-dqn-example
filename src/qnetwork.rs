@@ -1,4 +1,4 @@
-use rand::{random_range, seq::index};
+use rand::{random_range, seq::IteratorRandom};
 use std::collections::VecDeque;
 use tch::{
     nn::{self, Module, OptimizerConfig, VarStore},
@@ -63,20 +63,28 @@ impl ReplayBuffer {
     }
 
     pub fn sample(&self, batch_size: usize) -> Vec<&Transition> {
-        if self.transitions.len() < batch_size {
-            let what_we_have = self.transitions.iter().collect();
-            what_we_have
-        } else {
-            let mut rng = rand::rng();
-            let indices = index::sample(&mut rng, self.transitions.len(), batch_size);
-
-            let batch = indices
-                .into_iter()
-                .map(|index| &self.transitions[index])
-                .collect();
-            batch
-        }
+        let mut rng = rand::rng();
+        let sample_size = std::cmp::min(batch_size, self.transitions.len());
+        self.transitions.iter().choose_multiple(&mut rng, sample_size)
     }
+}
+
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+
+pub struct AgentConfig {
+    pub learning_rate: f64,
+    pub gamma: f32,
+    pub epsilon_decay: f32,
+    pub epsilon_min: f32,
+    pub replay_buffer_capacity: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct AgentState {
+    epsilon: f32,
+    model_bytes: Vec<u8>,
 }
 
 pub struct DQNAgent {
@@ -84,7 +92,7 @@ pub struct DQNAgent {
     target_network: QNetwork,
     pub replay_buffer: ReplayBuffer,
     optimizer: tch::nn::Optimizer,
-    step_counter: u64,
+    pub step_counter: u64,
     pub epsilon: f32,
     gamma: f32,
     vs_main: VarStore,
@@ -94,7 +102,7 @@ pub struct DQNAgent {
 }
 
 impl DQNAgent {
-    pub fn new() -> Self {
+    pub fn new(config: AgentConfig) -> Self {
         let device = Device::cuda_if_available();
         let vs_main = VarStore::new(device);
         let q_network = QNetwork::new(&vs_main.root());
@@ -104,14 +112,13 @@ impl DQNAgent {
 
         vs_target.copy(&vs_main).unwrap();
 
-        let optimizer = tch::nn::Adam::default().build(&vs_main, 1e-4).unwrap();
+        let optimizer = tch::nn::Adam::default()
+            .build(&vs_main, config.learning_rate)
+            .unwrap();
 
-        let replay_buffer = ReplayBuffer::new(50000);
+        let replay_buffer = ReplayBuffer::new(config.replay_buffer_capacity);
         let step_counter = 0;
         let epsilon = 1.0;
-        let gamma = 0.99;
-        let epsilon_decay = 0.995;
-        let epsilon_min = 0.01;
 
         Self {
             q_network,
@@ -120,11 +127,11 @@ impl DQNAgent {
             optimizer,
             step_counter,
             epsilon,
-            gamma,
+            gamma: config.gamma,
             vs_main,
             vs_target,
-            epsilon_decay,
-            epsilon_min,
+            epsilon_decay: config.epsilon_decay,
+            epsilon_min: config.epsilon_min,
         }
     }
 
@@ -132,7 +139,7 @@ impl DQNAgent {
         let rand: f32 = random_range(0.0..1.0);
 
         if self.epsilon > rand {
-            let random_decision = random_range(0..1);
+            let random_decision = random_range(0..2);
             match random_decision {
                 0 => {
                     // go left
@@ -269,8 +276,6 @@ impl DQNAgent {
 
         let next_actions = self.q_network.forward(&tensor_next_states).argmax(1, true);
 
-        //let next_q_values = self.target_network.forward(&tensor_next_states);
-        //let max_next_q_values = next_q_values.max_dim(1, false).0;
         let max_next_q_values = self
             .target_network
             .forward(&tensor_next_states)
@@ -287,13 +292,11 @@ impl DQNAgent {
 
         let loss = predicted_q_values.mse_loss(&target_q_values, tch::Reduction::Mean);
 
-        /*
-        Training
-         */
-
         self.optimizer.zero_grad();
         loss.backward();
         self.optimizer.step();
+
+        self.step_counter += 1;
 
         if self.epsilon > self.epsilon_min {
             self.epsilon *= self.epsilon_decay;
@@ -304,13 +307,32 @@ impl DQNAgent {
         self.vs_target.copy(&self.vs_main).unwrap();
     }
 
-    pub fn save(&self, path: &str) -> Result<(), tch::TchError> {
-        self.vs_main.save(path)
+    pub fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buffer: Vec<u8> = Vec::new();
+        self.vs_main.save_to_stream(&mut buffer)?;
+
+        let state = AgentState {
+            epsilon: self.epsilon,
+            model_bytes: buffer,
+        };
+
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        bincode::serialize_into(&mut writer, &state)?;
+
+        Ok(())
     }
 
-    pub fn load(&mut self, path: &str) -> Result<(), tch::TchError> {
-        self.vs_main.load(path)?;
+    pub fn load(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let state: AgentState = bincode::deserialize_from(&mut reader)?;
+
+        self.epsilon = state.epsilon;
+        let mut model_reader = std::io::Cursor::new(state.model_bytes);
+        self.vs_main.load_from_stream(&mut model_reader)?;
         self.vs_target.copy(&self.vs_main)?;
+
         Ok(())
     }
 }

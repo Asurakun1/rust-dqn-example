@@ -8,8 +8,6 @@ pub struct CartPole {
     force_magnitude: f32,
     time_step: f32,
     pole_length: f32,
-    angle_limit: f32,
-    position_limit: f32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -34,8 +32,6 @@ impl CartPole {
             force_magnitude: 10.0,
             time_step: 0.02,
             pole_length: 0.5,
-            angle_limit: 0.209,
-            position_limit: 2.4,
         }
     }
 
